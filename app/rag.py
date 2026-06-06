@@ -1,75 +1,137 @@
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from functools import lru_cache
+
 import torch
-from .config import *
+from langchain_community.vectorstores import FAISS
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_huggingface import (
+    HuggingFaceEmbeddings,
+    HuggingFacePipeline,
+)
 
-_rag_chain = None
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    pipeline,
+)
 
+from .config import (
+    EMBEDDING_MODEL,
+    LLM_MODEL,
+    VECTORSTORE_DIR,
+    TOP_K_RETRIEVAL,
+    MAX_NEW_TOKENS,
+)
+
+
+@lru_cache(maxsize=1)
 def load_chain():
-    global _rag_chain
-    if _rag_chain is not None:
-        return _rag_chain
+    print("=" * 50)
+    print("Loading RAG Chain...")
+    print("=" * 50)
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"}
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    torch_dtype = (
+        torch.float16
+        if torch.cuda.is_available()
+        else torch.float32
     )
 
+    print(f"Using device: {device}")
+
+    # Embeddings
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        model_kwargs={"device": device},
+    )
+
+    print("Embeddings loaded")
+
+    # Vector Store
     vectorstore = FAISS.load_local(
         VECTORSTORE_DIR,
         embeddings,
-        allow_dangerous_deserialization=True
+        allow_dangerous_deserialization=True,
     )
+
     retriever = vectorstore.as_retriever(
         search_kwargs={"k": TOP_K_RETRIEVAL}
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
+    print("Vectorstore loaded")
+
+    # LLM
+    tokenizer = AutoTokenizer.from_pretrained(
+        LLM_MODEL
+    )
+
     model = AutoModelForCausalLM.from_pretrained(
         LLM_MODEL,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto"
+        torch_dtype=torch_dtype,
+        device_map="auto" if torch.cuda.is_available() else None,
     )
+
+    if device == "cpu":
+        model.to(device)
+
+    print("Model loaded")
+
     hf_pipeline = pipeline(
-        "text-generation",
+        task="text-generation",
         model=model,
         tokenizer=tokenizer,
         max_new_tokens=MAX_NEW_TOKENS,
         do_sample=False,
-        temperature=1.0,
-        return_full_text=False
+        return_full_text=False,
     )
-    llm = HuggingFacePipeline(pipeline=hf_pipeline)
+
+    llm = HuggingFacePipeline(
+        pipeline=hf_pipeline
+    )
 
     prompt = PromptTemplate.from_template(
         """
-        You are a helpful assistant. Answer the question using ONLY the context below.
-        If the answer is not in the context, say "I don't have that information in the documents."
-        
-        Context:
-        {context}
+You are a helpful assistant.
 
-        Question: {question}
+Answer ONLY using the provided context.
 
-        Answer:
-        """
+If the answer cannot be found in the context,
+say:
+
+"I don't have that information in the documents."
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
     )
 
     def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
+        return "\n\n".join(
+            doc.page_content
+            for doc in docs
+        )
 
-    _rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    chain = (
+        {
+            "context": retriever | format_docs,
+            "question": RunnablePassthrough(),
+        }
         | prompt
         | llm
         | StrOutputParser()
     )
 
-    return _rag_chain
+    print("RAG Chain Ready")
+    print("=" * 50)
+
+    return chain
 
 
 def ask_question(question: str) -> str:
